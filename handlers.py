@@ -8,7 +8,8 @@ from aiogram.fsm.context import FSMContext
 from bot import bot
 import keyboard as kb
 from google_sheets import get_products_by_category, get_product
-from crm import create_lead
+from crm import create_lead, debug_create_lead, test_bitrix_connection
+
 router = Router(name=__name__)
 tasks = {}
 reply_events: dict[int, asyncio.Event] = {}
@@ -23,6 +24,7 @@ class OrderStates(StatesGroup):
     choosing_quantity = State()
     adding_more = State()
     confirming_order = State()
+    entering_name = State()  # Добавлено состояние для имени
     entering_contact = State()
     entering_address = State()
     editing_quantity = State()
@@ -146,7 +148,7 @@ async def show_cart(callback: CallbackQuery, state: FSMContext):
     for i, p in enumerate(products):
         subtotal = int(p["priece"]) * p["quantity"]
         total += subtotal
-        message += f"{i+1}. {p['name']} x{p['quantity']} = {subtotal}₽\n"
+        message += f"{i + 1}. {p['name']} x{p['quantity']} = {subtotal}₽\n"
 
     message += f"\n💰 Сумма: {total}₽"
     await callback.message.answer(message, reply_markup=kb.create_cart_buttons(products))
@@ -211,18 +213,39 @@ async def update_quantity(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "purchase")
 async def purchase_cart(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите номер телефона в формате +7xxxxxxxxxx", reply_markup=kb.return_to_cart_summary())
-    await state.set_state(OrderStates.entering_contact)
+    await callback.message.answer("👤 Как к вам обращаться? Введите ваше имя:", reply_markup=kb.return_to_cart_summary())
+    await state.set_state(OrderStates.entering_name)
     await callback.answer()
+
+
+@router.message(OrderStates.entering_name)
+async def receive_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+
+    if len(name) < 2:
+        await message.answer("❌ Пожалуйста, введите корректное имя (не менее 2 символов).")
+        return
+
+    await state.update_data(name=name)
+    await message.answer(f"✅ Приятно познакомиться, {name}! Теперь введите номер телефона в формате +7xxxxxxxxxx")
+    await state.set_state(OrderStates.entering_contact)
 
 
 @router.message(OrderStates.entering_contact)
 async def receive_phone(message: Message, state: FSMContext):
     phone = message.text.strip()
 
-    if not phone.startswith('+') or not phone[1:].isdigit():
-        await message.answer("❌ Пожалуйста, введите корректный номер телефона (например, +79991234567).")
+    # Более гибкая проверка телефона
+    if not (phone.startswith('+7') or phone.startswith('8') or phone.startswith('7')):
+        await message.answer(
+            "❌ Пожалуйста, введите корректный номер телефона (например, +79991234567, 89991234567 или 79991234567).")
         return
+
+    # Нормализация номера
+    if phone.startswith('8'):
+        phone = '+7' + phone[1:]
+    elif phone.startswith('7') and not phone.startswith('+7'):
+        phone = '+' + phone
 
     await state.update_data(phone=phone)
     await message.answer("✅ Номер сохранён. Теперь укажите адрес доставки:")
@@ -240,13 +263,20 @@ async def receive_address(message: Message, state: FSMContext):
     await state.update_data(address=address)
 
     data = await state.get_data()
+    name = data.get("name")
     phone = data.get("phone")
+    products = data.get("products", [])
+
+    # Подсчитываем итоговую сумму
+    total = sum(int(p["priece"]) * int(p.get("quantity", 1)) for p in products)
 
     await message.answer(
-        f"📋 Данные для доставки:\n\n"
+        f"📋 Проверьте данные заказа:\n\n"
+        f"👤 Имя: {name}\n"
         f"📞 Телефон: {phone}\n"
-        f"🏠 Адрес: {address}\n\n"
-        f"🛒 Готовы оформить заказ?",
+        f"🏠 Адрес: {address}\n"
+        f"💰 Сумма заказа: {total}₽\n\n"
+        f"✅ Всё верно? Подтверждаем заказ?",
         reply_markup=kb.confirm_order_menu()
     )
     await state.set_state(OrderStates.confirming_order)
@@ -256,20 +286,55 @@ async def receive_address(message: Message, state: FSMContext):
 async def confirm_order(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
 
+    # Получаем данные пользователя из Telegram
+    user = callback.from_user
+    telegram_name = user.first_name
+    if user.last_name:
+        telegram_name += f" {user.last_name}"
+
     lead_data = {
-        "name": data.get("name"),
+        "name": data.get("name", telegram_name),  # Используем введённое имя или данные из Telegram
         "phone": data.get("phone"),
         "address": data.get("address"),
-        "telegram_id": callback.from_user.id,
+        "telegram_id": user.id,
+        "telegram_username": user.username,  # Убираем проверку на None
         "products": data.get("products", [])
     }
 
-    if create_lead(lead_data):
-        await callback.message.answer("✅ Заказ подтвержден и отправлен в CRM!")
+    print(f"🔄 Создаём заказ для пользователя: {lead_data['name']}")
+    print(f"📦 Товаров в заказе: {len(lead_data['products'])}")
+
+    # Выводим детали заказа для отладки
+    total_amount = 0
+    for product in lead_data['products']:
+        price = int(product.get("priece", 0))
+        quantity = int(product.get("quantity", 1))
+        subtotal = price * quantity
+        total_amount += subtotal
+        print(f"   - {product.get('name')}: {price}₽ x {quantity} = {subtotal}₽")
+
+    print(f"💰 Общая сумма заказа: {total_amount}₽")
+
+    # Используем debug версию для отладки
+    if debug_create_lead(lead_data):
+        await callback.message.answer(
+            f"✅ Заказ успешно подтверждён и отправлен в систему!\n"
+            f"💰 Сумма заказа: {total_amount}₽\n"
+            f"📞 Наш менеджер свяжется с вами в ближайшее время.\n"
+            f"☕️ Спасибо за заказ!",
+            reply_markup=kb.main
+        )
     else:
-        await callback.message.answer("❌ Не удалось создать заказ в CRM.")
+        await callback.message.answer(
+            "❌ Произошла ошибка при создании заказа.\n"
+            "📞 Пожалуйста, свяжитесь с нами напрямую или попробуйте позже.\n"
+            "Ваш заказ сохранён и будет обработан.",
+            reply_markup=kb.main
+        )
 
     await state.clear()
+    await callback.answer()
+
 
 @router.callback_query(F.data == "show_cart_summary")
 async def show_cart_summary(callback: CallbackQuery, state: FSMContext):
@@ -293,3 +358,12 @@ async def show_cart_summary_message(chat_id: int, state: FSMContext):
         reply_markup=kb.cart_menu()
     )
 
+
+# Команда для тестирования CRM
+@router.message(F.text == "/test_crm")
+async def test_crm(message: Message):
+    """Тестирование подключения к CRM"""
+    if test_bitrix_connection():
+        await message.answer("✅ Подключение к Bitrix24 работает!")
+    else:
+        await message.answer("❌ Проблема с подключением к Bitrix24. Проверьте настройки.")
